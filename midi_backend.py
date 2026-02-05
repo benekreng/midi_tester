@@ -1,3 +1,4 @@
+import time
 import mido
 
 class MidiBackend:
@@ -29,20 +30,14 @@ class MidiBackend:
             self.out_port = None
 
     def toggle_virtual_mode(self, state):
-        """
-        If State is True: Create a Virtual Device that other apps see.
-        If State is False: Close virtual device, allow manual connection.
-        """
         self.close_ports()
         self.virtual_mode = state
         
         if state:
             try:
-                # virtual=True creates a port in the OS that other apps can see
-                # On macOS, 'Python Emulator' will appear in your DAW inputs/outputs
+                # On macOS/Linux this works natively. On Windows, requires LoopMIDI usually.
                 self.in_port = mido.open_input('Python Emulator', virtual=True)
                 self.out_port = mido.open_output('Python Emulator', virtual=True)
-                print("Created Virtual Device: 'Python Emulator'")
                 return True, "Created Virtual Port: 'Python Emulator'"
             except NotImplementedError:
                 self.virtual_mode = False
@@ -53,22 +48,20 @@ class MidiBackend:
         return True, "Switched to Physical Mode"
 
     def connect_input(self, port_name):
-        if self.virtual_mode: return False # Ignore if in virtual mode
+        if self.virtual_mode: return False
         if self.in_port: self.in_port.close()
         try:
             self.in_port = mido.open_input(port_name)
-            print(f"Connected Input: {port_name}")
             return True
         except Exception as e:
             print(f"Error input: {e}")
             return False
 
     def connect_output(self, port_name):
-        if self.virtual_mode: return False # Ignore if in virtual mode
+        if self.virtual_mode: return False
         if self.out_port: self.out_port.close()
         try:
             self.out_port = mido.open_output(port_name)
-            print(f"Connected Output: {port_name}")
             return True
         except Exception as e:
             print(f"Error output: {e}")
@@ -111,10 +104,31 @@ class MidiBackend:
     def send_aftertouch(self, channel, value):
         if self.out_port:
             self.out_port.send(mido.Message('aftertouch', channel=channel, value=value))
-
-    def send_poly_aftertouch(self, channel, note, value):
+    
+    def send_note(self, channel, note, velocity):
         if self.out_port:
-            self.out_port.send(mido.Message('polytouch', channel=channel, note=note, value=value))
+            self.out_port.send(mido.Message('note_on', channel=channel, note=note, velocity=velocity))
+            
+    def send_event_struct(self, e):
+        """Helper to send a structured event dict (from poll_messages) back out."""
+        try:
+            ch = e['channel']
+            if e['type'] == 'note':
+                self.send_note(ch, e['note'], e['velocity'])
+            elif e['type'] == 'cc':
+                self.send_cc(ch, e['cc'], e['value'])
+            elif e['type'] == 'cc14':
+                self.send_cc14(ch, e['cc'], e['value'])
+            elif e['type'] == 'nrpn':
+                self.send_nrpn(ch, e['nrpn'], e['value'])
+            elif e['type'] == 'pb':
+                self.send_pitch_bend(ch, e['value'])
+            elif e['type'] == 'pc':
+                self.send_program_change(ch, e['value'])
+            elif e['type'] == 'at':
+                self.send_aftertouch(ch, e['value'])
+        except Exception as err:
+            print(f"Failed to retransmit: {err}")
 
     # --- RECEIVE LOOP ---
 
@@ -122,75 +136,73 @@ class MidiBackend:
         if not self.in_port: return []
         
         events = []
-        # iter_pending is non-blocking
         for msg in self.in_port.iter_pending():
+            print(msg)
+            # Use nanosecond precision for better timestamp accuracy
+            ts = time.perf_counter_ns() / 1e9
             
             if msg.type == 'note_on' or msg.type == 'note_off':
                 events.append({
                     'type': 'note',
                     'channel': msg.channel,
                     'note': msg.note,
-                    'velocity': msg.velocity if msg.type == 'note_on' else 0
+                    'velocity': msg.velocity if msg.type == 'note_on' else 0,
+                    'timestamp': ts,
                 })
 
             elif msg.type == 'pitchwheel':
                 raw_val = msg.pitch + 8192
-                events.append({'type': 'pb', 'channel': msg.channel, 'value': raw_val})
+                events.append({'type': 'pb', 'channel': msg.channel, 'value': raw_val, 'timestamp': ts})
 
             elif msg.type == 'program_change':
-                events.append({'type': 'pc', 'channel': msg.channel, 'value': msg.program})
+                events.append({'type': 'pc', 'channel': msg.channel, 'value': msg.program, 'timestamp': ts})
 
             elif msg.type == 'aftertouch':
-                events.append({'type': 'at', 'channel': msg.channel, 'value': msg.value})
+                events.append({'type': 'at', 'channel': msg.channel, 'value': msg.value, 'timestamp': ts})
 
             elif msg.type == 'polytouch':
-                 events.append({'type': 'poly_at', 'channel': msg.channel, 'note': msg.note, 'value': msg.value})
+                 events.append({'type': 'poly_at', 'channel': msg.channel, 'note': msg.note, 'value': msg.value, 'timestamp': ts})
 
             elif msg.type == 'control_change':
                 ccNum = msg.control
                 ccVal = msg.value
 
-                # NRPN MSB/LSB Setup
+                # NRPN Logic
                 if ccNum == 99:
                     self._nrpn_msb = ccVal
                     continue
                 if ccNum == 98:
                     self._nrpn_lsb = ccVal
                     continue
-                
-                # RPN Reset Logic
                 if ccNum == 100 or ccNum == 101:
                     self._nrpn_msb = -1
                     self._nrpn_lsb = -1
                 
-                # NRPN Data Entry
                 if self._nrpn_msb != -1 and self._nrpn_lsb != -1:
                     if ccNum == 6:
                         self._nrpn_val_msb = ccVal
                         nrpn_num = (self._nrpn_msb << 7) | self._nrpn_lsb
                         val14 = (ccVal << 7)
-                        events.append({'type': 'nrpn', 'channel': msg.channel, 'nrpn': nrpn_num, 'value': val14})
+                        events.append({'type': 'nrpn', 'channel': msg.channel, 'nrpn': nrpn_num, 'value': val14, 'timestamp': ts})
                         continue
-                    
                     if ccNum == 38:
                         msb = 0 if self._nrpn_val_msb == -1 else self._nrpn_val_msb
                         nrpn_num = (self._nrpn_msb << 7) | self._nrpn_lsb
                         val14 = (msb << 7) | ccVal
-                        events.append({'type': 'nrpn', 'channel': msg.channel, 'nrpn': nrpn_num, 'value': val14})
+                        events.append({'type': 'nrpn', 'channel': msg.channel, 'nrpn': nrpn_num, 'value': val14, 'timestamp': ts})
                         continue
 
                 # CC14 Logic
                 if 32 <= ccNum <= 63 and self._cc14_msb_num == (ccNum - 32):
                      val14 = (self._cc14_msb_val << 7) | ccVal
-                     events.append({'type': 'cc14', 'channel': msg.channel, 'cc': self._cc14_msb_num, 'value': val14})
+                     events.append({'type': 'cc14', 'channel': msg.channel, 'cc': self._cc14_msb_num, 'value': val14, 'timestamp': ts})
                      self._cc14_msb_num = -1
                      continue
 
-                # Standard CC / CC14 Start
                 if ccNum <= 31:
                     self._cc14_msb_num = ccNum
                     self._cc14_msb_val = ccVal
                 
-                events.append({'type': 'cc', 'channel': msg.channel, 'cc': ccNum, 'value': ccVal})
+                events.append({'type': 'cc', 'channel': msg.channel, 'cc': ccNum, 'value': ccVal, 'timestamp': ts})
 
         return events
