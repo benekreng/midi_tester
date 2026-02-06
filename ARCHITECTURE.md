@@ -69,6 +69,7 @@ while running:
 - Low-level MIDI message sending
 - MIDI message parsing and assembly
 - Protocol-level state management (NRPN, 14-bit CC parsing)
+- High-precision capture via callback queue (timestamps on arrival)
 
 **Key Classes:**
 - `MidiBackend` - Main MIDI communication class
@@ -130,6 +131,11 @@ State Machine:
 - 14-bit values: `(MSB << 7) | LSB`
 - NRPN address: `(MSB << 7) | LSB`
 
+**Input Capture Path:**
+- Input ports use `mido.open_input(..., callback=...)` to timestamp messages immediately.
+- Callback pushes raw messages into a bounded queue.
+- `poll_messages()` drains the queue and runs the protocol parser on the main thread.
+
 ---
 
 #### 3. **processor.py** - MIDI Processing & Feedback Logic
@@ -161,23 +167,58 @@ scheduled_events = deque()  # (release_time, event_data)
 
 ---
 
-#### 4. **endurance_monitor.py** - Endurance Latency Monitor
+#### 4. **message_types.py** - Message Abstractions & Identity
+**Responsibilities:**
+- Define a uniform `MessageSpec` (type, channel, number, value)
+- Provide identity mapping for latency matching
+- Provide default probe values and random generation
+- Centralize message type labels and ranges
+
+**Key Types:**
+- `MessageSpec`
+- `TYPE_*` constants (note, cc, cc14, nrpn, pc, pb)
+
+---
+
+#### 5. **timing_model.py** - Timing Model
+**Responsibilities:**
+- Generate variable delays between fuzz messages
+- Support preset timing modes (steady/jitter/burst/chaos)
+- Support full timing controls (rate, jitter, burst, min/max gap)
+
+---
+
+#### 6. **endurance_monitor.py** - Endurance Response Monitor
 **Responsibilities:**
 - Periodically send a probe chord at a fixed interval
-- Measure round-trip latency and chord spread for each probe
+- Measure round-trip latency and inter-event dispersion for each probe
 - Track long-running results with bounded history for plotting
-- Detect “strumming” (spread > 0) over time
+- Detect “strumming” (dispersion > 0) over time
+- Probe multiple message types (notes, CC, CC14, NRPN, PC, PB)
 
 **Key Classes:**
 - `EnduranceLatencyMonitor` - Probe scheduler and analyzer
 
 **Metrics:**
-- **Round Trip Latency**: First note received minus send time
-- **Chord Spread**: Last note received minus first note received
+- **Round Trip Latency**: First message received minus send time
+- **Inter-Event Dispersion**: Last message received minus first message received
 
 ---
 
-#### 5. **gui.py** - User Interface & Visualization
+#### 7. **fuzz_test.py** - Fuzz Generator & Analyzer
+**Responsibilities:**
+- Generate unique, non-overlapping message identities
+- Schedule variable timing (bursts + jitter)
+- Match returned messages and compute RTT statistics
+- Track missing messages and log them
+
+**Key Components:**
+- `FuzzGenerator` - message creation + scheduling
+- `FuzzAnalyzer` - matching + stats + missing log
+
+---
+
+#### 8. **gui.py** - User Interface & Visualization
 **Responsibilities:**
 - Render DearPyGUI interface
 - Handle user input
@@ -219,6 +260,19 @@ PARAMS = {
 - Note/Velocity display
 - Polyphonic Aftertouch display (parsed but not used elsewhere)
 - Scrolling log window (max 20 entries)
+
+**Endurance Test Tab:**
+- Start/stop endurance probe loop
+- Configure probe interval, note list, and message types
+- **Plot 1:** Inter-Event Dispersion (ms) vs. Test Duration (min)
+- **Plot 2:** Per-message offset (ms) vs. Test Duration (min)
+
+**Fuzz Stress Test Tab:**
+- Generate unique, non-overlapping message identities
+- Preset timing modes (steady/jitter/burst/chaos) or full timing controls
+- Mixed, single-type, or chaos message generation modes
+- Live mean/std/min/max RTT metrics
+- Missing-message log
 
 **GUI Features:**
 - ✅ Real-time knob updates from incoming MIDI (bidirectional)

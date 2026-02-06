@@ -1,8 +1,20 @@
 import time
 from collections import deque
 
+from message_types import (
+    TYPE_NOTE,
+    TYPE_CC,
+    TYPE_CC14,
+    TYPE_NRPN,
+    TYPE_PC,
+    TYPE_PB,
+    PROBE_DEFAULTS,
+    random_spec,
+    event_to_spec,
+)
+
 class EnduranceLatencyMonitor:
-    def __init__(self, midi_backend, interval_s=0.1, probe_notes=None, velocity=100,
+    def __init__(self, midi_backend, interval_s=5.0, probe_notes=None, velocity=100,
                  note_length_ms=50, max_points=20000):
         self.midi = midi_backend
 
@@ -12,6 +24,7 @@ class EnduranceLatencyMonitor:
         self.velocity = int(velocity)
         self.note_length_s = max(0.0, note_length_ms / 1000.0)
         self.max_points = max_points
+        self.probe_types = [TYPE_NOTE]
 
         self.start_time = None
         self.next_probe_time = None
@@ -20,11 +33,15 @@ class EnduranceLatencyMonitor:
 
         self.results_x = deque(maxlen=max_points)
         self.results_y = deque(maxlen=max_points)
+        self.offsets_x = {}
+        self.offsets_y = {}
+        self.offset_labels = []
         self.last_result = None
         self.missed_probes = 0
         self.probes_sent = 0
         self._plot_dirty = False
         self._new_result = False
+        self._init_offset_buffers()
 
     def set_enabled(self, enabled):
         if enabled and not self.enabled:
@@ -46,6 +63,7 @@ class EnduranceLatencyMonitor:
         self.probes_sent = 0
         self._plot_dirty = True
         self._new_result = False
+        self._init_offset_buffers()
 
     def stop(self):
         self.enabled = False
@@ -55,6 +73,7 @@ class EnduranceLatencyMonitor:
     def clear_results(self):
         self.results_x.clear()
         self.results_y.clear()
+        self._init_offset_buffers()
         self.last_result = None
         self.missed_probes = 0
         self.probes_sent = 0
@@ -62,8 +81,7 @@ class EnduranceLatencyMonitor:
         self._new_result = False
 
     def set_interval(self, seconds):
-        # Allow intervals from 1ms (0.001s) to 1000ms (1.0s)
-        self.interval_s = max(0.001, min(1.0, float(seconds)))
+        self.interval_s = max(0.5, float(seconds))
 
     def set_probe_notes(self, notes):
         clean = []
@@ -74,13 +92,24 @@ class EnduranceLatencyMonitor:
                 continue
             if 0 <= val <= 127 and val not in clean:
                 clean.append(val)
-        if clean:
+        if clean and clean != self.probe_notes:
             self.probe_notes = clean
+            self.active_probe = None
+            self.note_off_schedule.clear()
+            self.clear_results()
+
+    def set_probe_types(self, types):
+        clean = []
+        for t in types:
+            if t and t not in clean:
+                clean.append(t)
+        if clean and clean != self.probe_types:
+            self.probe_types = clean
+            self.active_probe = None
+            self.note_off_schedule.clear()
+            self.clear_results()
 
     def get_timeout_s(self):
-        # Keep timeout comfortably under interval to avoid overlap
-        # For very fast intervals (< 10ms), use 80% of interval
-        # Otherwise use at least 5ms but no more than 80% of interval
         return max(0.005, min(2.0, self.interval_s * 0.8))
 
     def tick(self, events, selected_channel):
@@ -111,7 +140,6 @@ class EnduranceLatencyMonitor:
             return
 
         if self.active_probe:
-            # If we're late, consider the previous probe missed
             self._finalize_probe(complete=False)
 
         channel = 0 if selected_channel == -1 else int(selected_channel)
@@ -119,14 +147,36 @@ class EnduranceLatencyMonitor:
         self.next_probe_time = now + self.interval_s
 
     def _send_probe(self, now, channel):
-        expected = set(self.probe_notes)
+        expected = {}
+        for mtype in self.probe_types:
+            if mtype == TYPE_NOTE:
+                for note in self.probe_notes:
+                    spec = random_spec(
+                        TYPE_NOTE,
+                        channel,
+                        vary_number=False,
+                        vary_value=False,
+                        base_number=note,
+                        base_value=self.velocity,
+                    )
+                    expected[spec.identity()] = self._label_for_spec(spec)
+                    self.midi.send_note(channel, spec.number, spec.value)
+                    if self.note_length_s > 0:
+                        self.note_off_schedule.append((now + self.note_length_s, spec.number, channel))
+            else:
+                spec = random_spec(
+                    mtype,
+                    channel,
+                    vary_number=False,
+                    vary_value=False,
+                    base_number=PROBE_DEFAULTS[mtype]["number"],
+                    base_value=PROBE_DEFAULTS[mtype]["value"],
+                )
+                expected[spec.identity()] = self._label_for_spec(spec)
+                self._send_spec(spec)
+
         if not expected:
             return
-
-        for note in expected:
-            self.midi.send_note(channel, note, self.velocity)
-            if self.note_length_s > 0:
-                self.note_off_schedule.append((now + self.note_length_s, note, channel))
 
         self.active_probe = {
             'send_time': now,
@@ -142,26 +192,22 @@ class EnduranceLatencyMonitor:
             return
 
         probe = self.active_probe
-        expected = probe['expected']
 
         for e in events:
-            if e.get('type') != 'note':
+            spec = event_to_spec(e)
+            if not spec:
                 continue
-            if e.get('velocity', 0) <= 0:
+            identity = spec.identity()
+            if identity not in probe['expected']:
                 continue
-            if e.get('channel') != probe['channel']:
-                continue
-
-            note = e.get('note')
-            if note not in expected:
-                continue
-            if note in probe['received']:
+            label = probe['expected'][identity]
+            if label in probe['received']:
                 continue
 
             event_time = e.get('timestamp', now)
-            probe['received'][note] = event_time
+            probe['received'][label] = event_time
 
-            if len(probe['received']) == len(expected):
+            if len(probe['received']) == len(probe['expected']):
                 self._finalize_probe(complete=True)
                 break
 
@@ -190,15 +236,15 @@ class EnduranceLatencyMonitor:
         spread_ms = max(0.0, (last_time - first_time) * 1000.0)
         elapsed_min = (probe['send_time'] - self.start_time) / 60.0 if self.start_time else 0.0
 
-        # Debug logging for 0 spread cases
-        if spread_ms < 0.001:
-            print(f"DEBUG: Very low spread {spread_ms:.6f}ms - Times: {sorted(recv_times)}")
-            time_diffs = [f"{(recv_times[i] - recv_times[i-1])*1e6:.3f}µs" 
-                          for i in range(1, len(recv_times))]
-            print(f"  Time differences: {', '.join(time_diffs)}")
-
         self.results_x.append(elapsed_min)
         self.results_y.append(spread_ms)
+        for label, t in probe['received'].items():
+            offset_ms = max(0.0, (t - first_time) * 1000.0)
+            if label not in self.offsets_x:
+                self.offsets_x[label] = deque(maxlen=self.max_points)
+                self.offsets_y[label] = deque(maxlen=self.max_points)
+            self.offsets_x[label].append(elapsed_min)
+            self.offsets_y[label].append(offset_ms)
         self.last_result = {
             'round_trip_ms': round_trip_ms,
             'spread_ms': spread_ms,
@@ -210,11 +256,70 @@ class EnduranceLatencyMonitor:
     def get_plot_data(self):
         return list(self.results_x), list(self.results_y)
 
+    def get_offset_plot_data(self):
+        data = {}
+        for label in self.offset_labels:
+            xs = list(self.offsets_x.get(label, []))
+            ys = list(self.offsets_y.get(label, []))
+            data[label] = (xs, ys)
+        return data
+
     def consume_plot_dirty(self):
         if self._plot_dirty:
             self._plot_dirty = False
             return True
         return False
+
+    def _init_offset_buffers(self):
+        self.offset_labels = self._build_offset_labels()
+        self.offsets_x = {label: deque(maxlen=self.max_points) for label in self.offset_labels}
+        self.offsets_y = {label: deque(maxlen=self.max_points) for label in self.offset_labels}
+
+    def _build_offset_labels(self):
+        labels = []
+        for mtype in self.probe_types:
+            if mtype == TYPE_NOTE:
+                for note in self.probe_notes:
+                    labels.append(f"Note {note}")
+            elif mtype == TYPE_CC:
+                labels.append(f"CC {PROBE_DEFAULTS[mtype]['number']}")
+            elif mtype == TYPE_CC14:
+                labels.append(f"CC14 {PROBE_DEFAULTS[mtype]['number']}")
+            elif mtype == TYPE_NRPN:
+                labels.append(f"NRPN {PROBE_DEFAULTS[mtype]['number']}")
+            elif mtype == TYPE_PC:
+                labels.append(f"PC {PROBE_DEFAULTS[mtype]['number']}")
+            elif mtype == TYPE_PB:
+                labels.append("PB")
+        return labels
+
+    def _label_for_spec(self, spec):
+        if spec.mtype == TYPE_NOTE:
+            return f"Note {spec.number}"
+        if spec.mtype == TYPE_CC:
+            return f"CC {spec.number}"
+        if spec.mtype == TYPE_CC14:
+            return f"CC14 {spec.number}"
+        if spec.mtype == TYPE_NRPN:
+            return f"NRPN {spec.number}"
+        if spec.mtype == TYPE_PC:
+            return f"PC {spec.number}"
+        if spec.mtype == TYPE_PB:
+            return "PB"
+        return spec.mtype
+
+    def _send_spec(self, spec):
+        ch = spec.channel
+        if spec.mtype == TYPE_CC:
+            self.midi.send_cc(ch, spec.number, spec.value)
+        elif spec.mtype == TYPE_CC14:
+            self.midi.send_cc14(ch, spec.number, spec.value)
+        elif spec.mtype == TYPE_NRPN:
+            self.midi.send_nrpn(ch, spec.number, spec.value)
+        elif spec.mtype == TYPE_PC:
+            self.midi.send_program_change(ch, spec.number)
+        elif spec.mtype == TYPE_PB:
+            self.midi.send_pitch_bend(ch, spec.value)
 
     def get_status(self):
         now = time.perf_counter()
@@ -226,6 +331,7 @@ class EnduranceLatencyMonitor:
             'elapsed_min': elapsed_min,
             'interval_s': self.interval_s,
             'probe_notes': list(self.probe_notes),
+            'probe_types': list(self.probe_types),
             'probes_sent': self.probes_sent,
             'missed_probes': self.missed_probes,
             'last_result': self.last_result,

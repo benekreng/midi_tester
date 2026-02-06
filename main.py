@@ -2,6 +2,7 @@ import dearpygui.dearpygui as dpg
 from midi_backend import MidiBackend
 from processor import MidiProcessor
 from endurance_monitor import EnduranceLatencyMonitor
+from fuzz_test import FuzzTest
 from gui import AppGui
 
 def main():
@@ -9,10 +10,11 @@ def main():
     midi = MidiBackend()
     processor = MidiProcessor(midi)
     endurance = EnduranceLatencyMonitor(midi)
+    fuzz = FuzzTest(midi)
     
     # 2. Setup GUI
     dpg.create_context()
-    gui = AppGui(midi, processor, endurance)
+    gui = AppGui(midi, processor, endurance, fuzz)
     gui.build()
     
     dpg.setup_dearpygui()
@@ -44,9 +46,17 @@ def main():
         result = endurance.tick(processed_events, selected_ch)
         if endurance.consume_plot_dirty():
             gui.update_endurance_plot()
+            gui.update_endurance_offset_plot()
         if result:
             gui.update_endurance_metrics(result)
         gui.update_endurance_status()
+
+        # Fuzz Stress Test
+        fuzz.tick(processed_events, selected_ch)
+        if fuzz.consume_plot_dirty():
+            gui.update_fuzz_plot()
+        gui.update_fuzz_stats()
+        gui.update_fuzz_missing_log()
         
         for e in processed_events:
             if selected_ch != -1 and 'channel' in e and e['channel'] != selected_ch:
