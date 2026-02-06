@@ -1,4 +1,5 @@
 import time
+import math
 from collections import deque
 
 from message_types import (
@@ -19,12 +20,17 @@ class EnduranceLatencyMonitor:
         self.midi = midi_backend
 
         self.enabled = False
+        self.min_interval_s = 0.001
+        self.max_interval_s = 5.0
         self.interval_s = float(interval_s)
         self.probe_notes = list(probe_notes) if probe_notes else [60, 64, 67, 72]
         self.velocity = int(velocity)
         self.note_length_s = max(0.0, note_length_ms / 1000.0)
         self.max_points = max_points
         self.probe_types = [TYPE_NOTE]
+        self.mod_enabled = False
+        self.mod_freq_hz = 0.5
+        self.mod_depth_s = 0.0
 
         self.start_time = None
         self.next_probe_time = None
@@ -81,7 +87,17 @@ class EnduranceLatencyMonitor:
         self._new_result = False
 
     def set_interval(self, seconds):
-        self.interval_s = max(0.5, float(seconds))
+        self.interval_s = max(self.min_interval_s, min(self.max_interval_s, float(seconds)))
+        self._reschedule_next()
+
+    def set_modulation(self, enabled=None, freq_hz=None, depth_ms=None):
+        if enabled is not None:
+            self.mod_enabled = bool(enabled)
+        if freq_hz is not None:
+            self.mod_freq_hz = max(0.0, float(freq_hz))
+        if depth_ms is not None:
+            self.mod_depth_s = max(0.0, float(depth_ms) / 1000.0)
+        self._reschedule_next()
 
     def set_probe_notes(self, notes):
         clean = []
@@ -110,7 +126,7 @@ class EnduranceLatencyMonitor:
             self.clear_results()
 
     def get_timeout_s(self):
-        return max(0.005, min(2.0, self.interval_s * 0.8))
+        return max(self.min_interval_s, min(2.0, self.interval_s * 0.8))
 
     def tick(self, events, selected_channel):
         if not self.enabled:
@@ -144,7 +160,7 @@ class EnduranceLatencyMonitor:
 
         channel = 0 if selected_channel == -1 else int(selected_channel)
         self._send_probe(now, channel)
-        self.next_probe_time = now + self.interval_s
+        self.next_probe_time = now + self._current_interval(now)
 
     def _send_probe(self, now, channel):
         expected = {}
@@ -275,6 +291,22 @@ class EnduranceLatencyMonitor:
         self.offsets_x = {label: deque(maxlen=self.max_points) for label in self.offset_labels}
         self.offsets_y = {label: deque(maxlen=self.max_points) for label in self.offset_labels}
 
+    def _current_interval(self, now):
+        base = self.interval_s
+        if not self.mod_enabled or self.mod_freq_hz <= 0.0 or self.mod_depth_s <= 0.0:
+            return base
+        phase_t = 0.0 if self.start_time is None else (now - self.start_time)
+        mod = self.mod_depth_s * math.sin(2.0 * math.pi * self.mod_freq_hz * phase_t)
+        interval = base + mod
+        interval = max(self.min_interval_s, min(self.max_interval_s, interval))
+        return interval
+
+    def _reschedule_next(self):
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        self.next_probe_time = now + self._current_interval(now)
+
     def _build_offset_labels(self):
         labels = []
         for mtype in self.probe_types:
@@ -330,6 +362,9 @@ class EnduranceLatencyMonitor:
             'enabled': self.enabled,
             'elapsed_min': elapsed_min,
             'interval_s': self.interval_s,
+            'mod_enabled': self.mod_enabled,
+            'mod_freq_hz': self.mod_freq_hz,
+            'mod_depth_s': self.mod_depth_s,
             'probe_notes': list(self.probe_notes),
             'probe_types': list(self.probe_types),
             'probes_sent': self.probes_sent,

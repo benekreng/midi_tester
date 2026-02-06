@@ -285,6 +285,14 @@ PARAMS = {
 - ❌ NOT IMPLEMENTED: Preset management
 - ❌ NOT IMPLEMENTED: Multiple parameter pages
 
+---
+
+#### 9. **settings_store.py** - Persistent Settings
+**Responsibilities:**
+- Persist user settings to `settings.json`
+- Restore last-used input/output ports and key test configurations
+- Provide per-tab reset-to-default behavior
+
 **Callback Prevention:**
 - `update_knob_from_midi()` updates GUI values WITHOUT triggering send callbacks
 - Prevents infinite feedback loops when receiving MIDI

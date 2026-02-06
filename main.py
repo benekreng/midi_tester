@@ -3,6 +3,7 @@ from midi_backend import MidiBackend
 from processor import MidiProcessor
 from endurance_monitor import EnduranceLatencyMonitor
 from fuzz_test import FuzzTest
+from settings_store import SettingsStore
 from gui import AppGui
 
 def main():
@@ -11,10 +12,12 @@ def main():
     processor = MidiProcessor(midi)
     endurance = EnduranceLatencyMonitor(midi)
     fuzz = FuzzTest(midi)
+    settings = SettingsStore()
+    settings.load()
     
     # 2. Setup GUI
     dpg.create_context()
-    gui = AppGui(midi, processor, endurance, fuzz)
+    gui = AppGui(midi, processor, endurance, fuzz, settings)
     gui.build()
     
     dpg.setup_dearpygui()
@@ -23,8 +26,8 @@ def main():
     dpg.set_global_font_scale(1.25)
     
     # Initialize config
-    processor.set_delay(200) # Sync with GUI default
     gui.refresh_ports_cb(None, None)
+    gui.apply_settings()
 
     # 3. Main Loop
     while dpg.is_dearpygui_running():

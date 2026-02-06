@@ -24,16 +24,19 @@ PARAMS = {
 }
 
 class AppGui:
-    def __init__(self, midi_backend, processor, endurance_monitor, fuzz_test):
+    def __init__(self, midi_backend, processor, endurance_monitor, fuzz_test, settings_store):
         self.midi = midi_backend
         self.processor = processor
         self.endurance = endurance_monitor
         self.fuzz = fuzz_test
+        self.settings = settings_store
         self.log_items = []
         self._endurance_offset_labels = list(self.endurance.offset_labels)
         self._fuzz_missing_last = 0
         self._type_label_to_type = {LABELS[m]: m for m in ALL_TYPES}
         self._type_labels = [LABELS[m] for m in ALL_TYPES]
+        self._applying_settings = False
+        self._default_channel = "1"
 
     def log_midi(self, msg_str):
         dpg.add_text(msg_str, parent="log_group")
@@ -57,6 +60,8 @@ class AppGui:
         is_virt = app_data
         success, msg = self.midi.toggle_virtual_mode(is_virt)
         self.log_midi(msg)
+        self.settings.data["connections"]["virtual"] = bool(is_virt)
+        self._save_settings()
         
         if is_virt and success:
             dpg.hide_item("hw_connections")
@@ -68,14 +73,45 @@ class AppGui:
             if is_virt and not success:
                 dpg.set_value("virt_mode", False)
 
+    def input_port_cb(self, sender, app_data):
+        if self.midi.connect_input(app_data):
+            self.settings.data["connections"]["input_port"] = app_data
+            self._save_settings()
+
+    def output_port_cb(self, sender, app_data):
+        if self.midi.connect_output(app_data):
+            self.settings.data["connections"]["output_port"] = app_data
+            self._save_settings()
+
+    def channel_combo_cb(self, sender, app_data):
+        self.settings.data["connections"]["channel"] = app_data
+        self._save_settings()
+
+    def reset_main_cb(self, sender, app_data):
+        self.settings.reset_section("connections")
+        self.settings.reset_section("main")
+        self.apply_settings(section="main")
+
+    def reset_latency_cb(self, sender, app_data):
+        self.settings.reset_section("latency")
+        self.apply_settings(section="latency")
+
+    def reset_fuzz_cb(self, sender, app_data):
+        self.settings.reset_section("fuzz")
+        self.apply_settings(section="fuzz")
+
     def feedback_mode_cb(self, sender, app_data):
         # app_data will be "None", "Immediate", or "Delayed" based on radio button
         mode = app_data.upper()
         self.processor.set_feedback_mode(mode)
         self.log_midi(f"Feedback Mode: {mode}")
+        self.settings.data["main"]["feedback_mode"] = app_data
+        self._save_settings()
 
     def delay_time_cb(self, sender, app_data):
         self.processor.set_delay(int(app_data))
+        self.settings.data["main"]["delay_ms"] = int(app_data)
+        self._save_settings()
 
     def knob_cb(self, sender, app_data, user_data):
         param_key = user_data
@@ -121,11 +157,14 @@ class AppGui:
         self.update_endurance_status()
         if self.endurance.consume_plot_dirty():
             self.update_endurance_plot()
+        self.settings.data["latency"]["enabled"] = bool(app_data)
+        self._save_settings()
 
     def endurance_interval_cb(self, sender, app_data):
-        # Convert milliseconds to seconds
-        self.endurance.set_interval(app_data / 1000.0)
+        self.endurance.set_interval(app_data)
         self.update_endurance_status()
+        self.settings.data["latency"]["interval_s"] = float(app_data)
+        self._save_settings()
 
     def endurance_notes_cb(self, sender, app_data):
         notes = [n.strip() for n in str(app_data).split(',')]
@@ -135,6 +174,26 @@ class AppGui:
             dpg.set_value("endurance_notes_input", normalized)
         self.update_endurance_status()
         self.update_endurance_offset_plot()
+        self.settings.data["latency"]["probe_notes"] = normalized
+        self._save_settings()
+
+    def endurance_mod_toggle_cb(self, sender, app_data):
+        self.endurance.set_modulation(enabled=app_data)
+        self.update_endurance_status()
+        self.settings.data["latency"]["mod_enabled"] = bool(app_data)
+        self._save_settings()
+
+    def endurance_mod_freq_cb(self, sender, app_data):
+        self.endurance.set_modulation(freq_hz=app_data)
+        self.update_endurance_status()
+        self.settings.data["latency"]["mod_freq_hz"] = float(app_data)
+        self._save_settings()
+
+    def endurance_mod_depth_cb(self, sender, app_data):
+        self.endurance.set_modulation(depth_ms=app_data)
+        self.update_endurance_status()
+        self.settings.data["latency"]["mod_depth_ms"] = float(app_data)
+        self._save_settings()
 
     def endurance_types_cb(self, sender, app_data):
         selected = []
@@ -148,6 +207,8 @@ class AppGui:
         self.endurance.set_probe_types(selected)
         self.update_endurance_status()
         self.update_endurance_offset_plot()
+        self.settings.data["latency"]["probe_types"] = list(selected)
+        self._save_settings()
 
     def endurance_randomize_types_cb(self, sender, app_data):
         count = int(dpg.get_value("endurance_random_count"))
@@ -156,6 +217,13 @@ class AppGui:
         for mtype in ALL_TYPES:
             dpg.set_value(f"endurance_type_{mtype}", mtype in choices)
         self.endurance_types_cb(None, None)
+        self.settings.data["latency"]["random_type_count"] = count
+        self._save_settings()
+
+    def endurance_random_count_cb(self, sender, app_data):
+        count = int(app_data)
+        self.settings.data["latency"]["random_type_count"] = count
+        self._save_settings()
 
     def endurance_clear_cb(self, sender, app_data):
         self.endurance.clear_results()
@@ -167,6 +235,8 @@ class AppGui:
         self.update_fuzz_stats()
         if self.fuzz.consume_plot_dirty():
             self.update_fuzz_plot()
+        self.settings.data["fuzz"]["enabled"] = bool(app_data)
+        self._save_settings()
 
     def fuzz_mode_cb(self, sender, app_data):
         mode = app_data.lower()
@@ -183,14 +253,22 @@ class AppGui:
             dpg.hide_item("fuzz_single_group")
             dpg.hide_item("fuzz_mixed_group")
         self.update_fuzz_stats()
+        self.settings.data["fuzz"]["mode"] = app_data
+        self._save_settings()
 
     def fuzz_single_type_cb(self, sender, app_data):
         self.fuzz.generator.single_type = self._type_label_to_type.get(app_data, app_data)
+        self.settings.data["fuzz"]["single_type"] = self.fuzz.generator.single_type
+        self._save_settings()
 
     def fuzz_variation_cb(self, sender, app_data):
         self.fuzz.generator.vary_number = dpg.get_value("fuzz_vary_number")
         self.fuzz.generator.vary_value = dpg.get_value("fuzz_vary_value")
         self.fuzz.generator.randomize_channel = dpg.get_value("fuzz_random_channel")
+        self.settings.data["fuzz"]["vary_number"] = bool(self.fuzz.generator.vary_number)
+        self.settings.data["fuzz"]["vary_value"] = bool(self.fuzz.generator.vary_value)
+        self.settings.data["fuzz"]["random_channel"] = bool(self.fuzz.generator.randomize_channel)
+        self._save_settings()
 
     def fuzz_randomize_variation_cb(self, sender, app_data):
         vary_number = random.choice([True, False])
@@ -211,6 +289,8 @@ class AppGui:
             selected = [TYPE_NOTE]
             dpg.set_value("fuzz_type_note", True)
         self.fuzz.generator.allowed_types = selected
+        self.settings.data["fuzz"]["allowed_types"] = list(selected)
+        self._save_settings()
 
     def fuzz_timing_mode_cb(self, sender, app_data):
         mode = app_data.lower()
@@ -224,14 +304,20 @@ class AppGui:
             dpg.hide_item("fuzz_timing_preset_group")
             dpg.show_item("fuzz_timing_full_group")
             self.fuzz_full_params_cb(None, None)
+        self.settings.data["fuzz"]["timing_mode"] = app_data
+        self._save_settings()
 
     def fuzz_preset_cb(self, sender, app_data):
         intensity = dpg.get_value("fuzz_intensity_slider")
         self.fuzz.timing.set_preset(app_data, intensity)
+        self.settings.data["fuzz"]["preset"] = app_data
+        self._save_settings()
 
     def fuzz_intensity_cb(self, sender, app_data):
         preset = dpg.get_value("fuzz_preset_combo")
         self.fuzz.timing.set_preset(preset, app_data)
+        self.settings.data["fuzz"]["intensity"] = float(app_data)
+        self._save_settings()
 
     def fuzz_full_params_cb(self, sender, app_data):
         base_rate = dpg.get_value("fuzz_base_rate")
@@ -242,14 +328,23 @@ class AppGui:
         min_gap = dpg.get_value("fuzz_min_gap")
         max_gap = dpg.get_value("fuzz_max_gap")
         self.fuzz.timing.set_full(base_rate, jitter, burst_prob, burst_min, burst_max, min_gap, max_gap)
+        self.settings.data["fuzz"]["base_rate"] = float(base_rate)
+        self.settings.data["fuzz"]["jitter"] = float(jitter)
+        self.settings.data["fuzz"]["burst_prob"] = float(burst_prob)
+        self.settings.data["fuzz"]["burst_min"] = int(burst_min)
+        self.settings.data["fuzz"]["burst_max"] = int(burst_max)
+        self.settings.data["fuzz"]["min_gap"] = float(min_gap)
+        self.settings.data["fuzz"]["max_gap"] = float(max_gap)
+        self._save_settings()
 
     # --- BUILD GUI ---
     def build(self):
-        dpg.create_viewport(title='Exotic MIDI Emulator & Stress Tester', width=800, height=750)
+        dpg.create_viewport(title='Exotic MIDI Emulator & Stress Tester', width=1200, height=1000)
         
         with dpg.window(tag="Primary Window"):
             with dpg.tab_bar():
                 with dpg.tab(label="Main"):
+                    dpg.add_button(label="Reset Main Tab", callback=self.reset_main_cb)
                     # 1. Connection Header
                     with dpg.collapsing_header(label="Connections", default_open=True):
                         dpg.add_checkbox(label="Host Virtual Port", tag="virt_mode", callback=self.virt_mode_cb)
@@ -260,14 +355,15 @@ class AppGui:
                             with dpg.group(horizontal=True):
                                 dpg.add_button(label="Refresh Ports", callback=self.refresh_ports_cb)
                                 dpg.add_text("Ch:")
-                                dpg.add_combo([str(i) for i in range(1, 17)] + ["Omni"], default_value="1", width=80, tag="channel_combo")
+                                dpg.add_combo([str(i) for i in range(1, 17)] + ["Omni"], default_value="1", width=80,
+                                              tag="channel_combo", callback=self.channel_combo_cb)
                             
                             dpg.add_text("Input:")
                             dpg.add_combo([], tag="input_combo", width=300, 
-                                          callback=lambda s, a: self.midi.connect_input(a))
+                                          callback=self.input_port_cb)
                             dpg.add_text("Output:")
                             dpg.add_combo([], tag="output_combo", width=300, 
-                                          callback=lambda s, a: self.midi.connect_output(a))
+                                          callback=self.output_port_cb)
 
                     # 2. Stress Test / Feedback Header (NEW)
                     with dpg.collapsing_header(label="Stress Test & Feedback", default_open=True):
@@ -275,7 +371,7 @@ class AppGui:
                             with dpg.group():
                                 dpg.add_text("Feedback Mode:", color=(255, 200, 100))
                                 dpg.add_radio_button(["None", "Immediate", "Delayed"], default_value="None", 
-                                                     callback=self.feedback_mode_cb, horizontal=True)
+                                                     callback=self.feedback_mode_cb, horizontal=True, tag="feedback_mode")
                                 # Removed invalid 'size' argument
                                 dpg.add_text("(Immediate: Echoes inputs back instantly)")
                             
@@ -283,7 +379,7 @@ class AppGui:
                             with dpg.group():
                                 dpg.add_text("Delay (ms):")
                                 dpg.add_slider_int(min_value=1, max_value=2000, default_value=200, width=200,
-                                                   callback=self.delay_time_cb)
+                                                   callback=self.delay_time_cb, tag="delay_slider")
                                 # Removed invalid 'size' argument
                                 dpg.add_text("Simulates processing latency")
                         
@@ -316,16 +412,25 @@ class AppGui:
                     with dpg.child_window(tag="log_window", height=150, autosize_x=True):
                         dpg.add_group(tag="log_group")
 
-                with dpg.tab(label="Endurance Test"):
-                    dpg.add_text("Endurance Response Monitor", color=(150, 200, 255))
+                with dpg.tab(label="Latency Test"):
+                    dpg.add_text("Latency Response Monitor", color=(150, 200, 255))
                     dpg.add_spacer(height=4)
                     with dpg.group(horizontal=True):
                         dpg.add_checkbox(label="Enable Test", tag="endurance_enabled", callback=self.endurance_toggle_cb)
                         dpg.add_button(label="Clear Data", callback=self.endurance_clear_cb)
+                        dpg.add_button(label="Reset Latency Tab", callback=self.reset_latency_cb)
 
-                    dpg.add_slider_float(label="Probe Interval (sec)", min_value=1.0, max_value=30.0,
+                    dpg.add_slider_float(label="Base Interval (sec)", min_value=0.001, max_value=5.0,
                                          default_value=self.endurance.interval_s, width=220,
-                                         callback=self.endurance_interval_cb, tag="endurance_interval", format="%.1f")
+                                         callback=self.endurance_interval_cb, tag="endurance_interval", format="%.3f")
+                    dpg.add_checkbox(label="Modulate Interval", tag="endurance_mod_enable",
+                                     default_value=self.endurance.mod_enabled, callback=self.endurance_mod_toggle_cb)
+                    dpg.add_slider_float(label="Modulation Frequency (Hz)", min_value=0.01, max_value=10.0,
+                                         default_value=self.endurance.mod_freq_hz, width=220,
+                                         callback=self.endurance_mod_freq_cb, tag="endurance_mod_freq", format="%.2f")
+                    dpg.add_slider_float(label="Modulation Depth (ms)", min_value=0.0, max_value=2000.0,
+                                         default_value=self.endurance.mod_depth_s * 1000.0, width=220,
+                                         callback=self.endurance_mod_depth_cb, tag="endurance_mod_depth", format="%.1f")
 
                     dpg.add_text("Probe Message Types")
                     with dpg.group(horizontal=True):
@@ -336,7 +441,8 @@ class AppGui:
 
                     with dpg.group(horizontal=True):
                         dpg.add_slider_int(label="Random Type Count", min_value=1, max_value=len(ALL_TYPES),
-                                           default_value=min(3, len(ALL_TYPES)), width=160, tag="endurance_random_count")
+                                           default_value=min(3, len(ALL_TYPES)), width=160,
+                                           tag="endurance_random_count", callback=self.endurance_random_count_cb)
                         dpg.add_button(label="Randomize Types", callback=self.endurance_randomize_types_cb)
 
                     dpg.add_input_text(label="Probe Notes (CSV)", default_value=", ".join(str(n) for n in self.endurance.probe_notes),
@@ -370,6 +476,7 @@ class AppGui:
                     with dpg.group(horizontal=True):
                         dpg.add_checkbox(label="Enable Fuzz", tag="fuzz_enabled", callback=self.fuzz_toggle_cb)
                         dpg.add_text("Variable timing + unique identities", color=(200, 200, 200))
+                        dpg.add_button(label="Reset Fuzz Tab", callback=self.reset_fuzz_cb)
 
                     dpg.add_text("Message Mode")
                     dpg.add_radio_button(["Single Type", "Mixed Types", "Chaos"],
@@ -456,6 +563,131 @@ class AppGui:
     def _endurance_series_tag(self, label):
         safe = label.replace(" ", "_")
         return f"endurance_offset_{safe}"
+
+    def apply_settings(self, section=None):
+        self._applying_settings = True
+        try:
+            if section in (None, "main"):
+                conn = self.settings.data.get("connections", {})
+                main = self.settings.data.get("main", {})
+
+                channel_val = conn.get("channel", self._default_channel)
+                if dpg.does_item_exist("channel_combo"):
+                    dpg.set_value("channel_combo", channel_val)
+                    self.channel_combo_cb(None, channel_val)
+
+                virt = bool(conn.get("virtual", False))
+                dpg.set_value("virt_mode", virt)
+                self.virt_mode_cb(None, virt)
+
+                if not virt:
+                    in_port = conn.get("input_port", "")
+                    out_port = conn.get("output_port", "")
+                    if in_port:
+                        dpg.set_value("input_combo", in_port)
+                        self.midi.connect_input(in_port)
+                    if out_port:
+                        dpg.set_value("output_combo", out_port)
+                        self.midi.connect_output(out_port)
+
+                feedback = main.get("feedback_mode", "None")
+                if dpg.does_item_exist("feedback_mode"):
+                    dpg.set_value("feedback_mode", feedback)
+                    self.feedback_mode_cb(None, feedback)
+
+                delay_ms = int(main.get("delay_ms", 200))
+                if dpg.does_item_exist("delay_slider"):
+                    dpg.set_value("delay_slider", delay_ms)
+                    self.delay_time_cb(None, delay_ms)
+
+            if section in (None, "latency"):
+                latency = self.settings.data.get("latency", {})
+
+                enabled = bool(latency.get("enabled", False))
+                dpg.set_value("endurance_enabled", enabled)
+                self.endurance_toggle_cb(None, enabled)
+
+                interval_s = float(latency.get("interval_s", 5.0))
+                dpg.set_value("endurance_interval", interval_s)
+                self.endurance_interval_cb(None, interval_s)
+
+                mod_enabled = bool(latency.get("mod_enabled", False))
+                dpg.set_value("endurance_mod_enable", mod_enabled)
+                self.endurance_mod_toggle_cb(None, mod_enabled)
+
+                mod_freq = float(latency.get("mod_freq_hz", 0.5))
+                dpg.set_value("endurance_mod_freq", mod_freq)
+                self.endurance_mod_freq_cb(None, mod_freq)
+
+                mod_depth = float(latency.get("mod_depth_ms", 0.0))
+                dpg.set_value("endurance_mod_depth", mod_depth)
+                self.endurance_mod_depth_cb(None, mod_depth)
+
+                notes = latency.get("probe_notes", "60, 64, 67, 72")
+                dpg.set_value("endurance_notes_input", notes)
+                self.endurance_notes_cb(None, notes)
+
+                type_list = latency.get("probe_types", ["note"])
+                for mtype in ALL_TYPES:
+                    dpg.set_value(f"endurance_type_{mtype}", mtype in type_list)
+                self.endurance_types_cb(None, None)
+
+                rand_count = int(latency.get("random_type_count", 3))
+                dpg.set_value("endurance_random_count", rand_count)
+
+            if section in (None, "fuzz"):
+                fuzz = self.settings.data.get("fuzz", {})
+
+                mode = fuzz.get("mode", "Single Type")
+                dpg.set_value("fuzz_mode", mode)
+                self.fuzz_mode_cb(None, mode)
+
+                single_type = fuzz.get("single_type", "cc")
+                dpg.set_value("fuzz_single_type", LABELS.get(single_type, LABELS[TYPE_CC]))
+                self.fuzz_single_type_cb(None, LABELS.get(single_type, LABELS[TYPE_CC]))
+
+                dpg.set_value("fuzz_vary_number", bool(fuzz.get("vary_number", True)))
+                dpg.set_value("fuzz_vary_value", bool(fuzz.get("vary_value", True)))
+                dpg.set_value("fuzz_random_channel", bool(fuzz.get("random_channel", False)))
+                self.fuzz_variation_cb(None, None)
+
+                allowed = fuzz.get("allowed_types", list(ALL_TYPES))
+                for mtype in ALL_TYPES:
+                    dpg.set_value(f"fuzz_type_{mtype}", mtype in allowed)
+                self.fuzz_mixed_types_cb(None, None)
+
+                timing_mode = fuzz.get("timing_mode", "Preset")
+                dpg.set_value("fuzz_timing_mode", timing_mode)
+                self.fuzz_timing_mode_cb(None, timing_mode)
+
+                preset = fuzz.get("preset", "Steady")
+                intensity = float(fuzz.get("intensity", 0.5))
+                dpg.set_value("fuzz_preset_combo", preset)
+                dpg.set_value("fuzz_intensity_slider", intensity)
+                self.fuzz_preset_cb(None, preset)
+
+                dpg.set_value("fuzz_base_rate", float(fuzz.get("base_rate", 20.0)))
+                dpg.set_value("fuzz_jitter", float(fuzz.get("jitter", 0.0)))
+                dpg.set_value("fuzz_burst_prob", float(fuzz.get("burst_prob", 0.0)))
+                dpg.set_value("fuzz_burst_min", int(fuzz.get("burst_min", 2)))
+                dpg.set_value("fuzz_burst_max", int(fuzz.get("burst_max", 4)))
+                dpg.set_value("fuzz_min_gap", float(fuzz.get("min_gap", 0.0)))
+                dpg.set_value("fuzz_max_gap", float(fuzz.get("max_gap", 1000.0)))
+                self.fuzz_full_params_cb(None, None)
+
+                enabled = bool(fuzz.get("enabled", False))
+                dpg.set_value("fuzz_enabled", enabled)
+                self.fuzz_toggle_cb(None, enabled)
+        finally:
+            self._applying_settings = False
+
+    def _save_settings(self):
+        if self._applying_settings:
+            return
+        try:
+            self.settings.save()
+        except Exception:
+            pass
 
     def update_endurance_offset_plot(self):
         self._ensure_endurance_offset_series()

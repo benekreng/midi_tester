@@ -1,0 +1,50 @@
+{
+  "connections": {
+    "channel": "1",
+    "input_port": "Volt 1",
+    "output_port": "Volt 1",
+    "virtual": false
+  },
+  "fuzz": {
+    "allowed_types": [
+      "note",
+      "cc",
+      "cc14",
+      "nrpn",
+      "pc",
+      "pb"
+    ],
+    "base_rate": 20.0,
+    "burst_max": 4,
+    "burst_min": 2,
+    "burst_prob": 0.0,
+    "enabled": false,
+    "intensity": 0.5,
+    "jitter": 0.0,
+    "max_gap": 1000.0,
+    "min_gap": 0.0,
+    "mode": "Single Type",
+    "preset": "Steady",
+    "random_channel": false,
+    "single_type": "cc",
+    "timing_mode": "Preset",
+    "vary_number": true,
+    "vary_value": true
+  },
+  "latency": {
+    "enabled": false,
+    "interval_s": 0.09799999743700027,
+    "mod_depth_ms": 647.0999755859375,
+    "mod_enabled": false,
+    "mod_freq_hz": 3.9800000190734863,
+    "probe_notes": "60, 64, 67, 72",
+    "probe_types": [
+      "note"
+    ],
+    "random_type_count": 1
+  },
+  "main": {
+    "delay_ms": 200,
+    "feedback_mode": "None"
+  }
+}
