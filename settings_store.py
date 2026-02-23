@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     },
     "remote": {
         "expected_channel": "1",
+        "led_anim_interval_ms": 120,
     },
 }
 

@@ -14,6 +14,7 @@ MSG_EXIT_REMOTE = 0x00
 MSG_LED = 0x01
 MSG_OLED_FRAMEBUFFER = 0x02
 MSG_OLED_LABELS = 0x03
+MSG_LED_RING = 0x04
 
 MSG_NAMES = {
     MSG_ENTER_REMOTE: "ENTER_REMOTE",
@@ -22,6 +23,7 @@ MSG_NAMES = {
     MSG_LED: "LED",
     MSG_OLED_FRAMEBUFFER: "OLED_FRAMEBUFFER",
     MSG_OLED_LABELS: "OLED_LABELS",
+    MSG_LED_RING: "LED_RING",
 }
 
 
@@ -105,6 +107,18 @@ def _fixed_ascii(text, length):
     return out
 
 
+def _color_wheel_7bit(position):
+    """Return a smooth RGB wheel color with channels clamped to 0..127."""
+    p = int(position) % 384
+    if p < 128:
+        return 127 - p, p, 0
+    if p < 256:
+        p -= 128
+        return 0, 127 - p, p
+    p -= 256
+    return p, 0, 127 - p
+
+
 class RemoteProtocolTester:
     def __init__(self, midi_backend):
         self.midi = midi_backend
@@ -130,6 +144,13 @@ class RemoteProtocolTester:
         self.suite_results = []
         self.suite_manual_pending = False
         self._manual_decision = None
+
+        self.led_anim_running = False
+        self.led_anim_mode = ""
+        self.led_anim_interval_s = 0.12
+        self._led_anim_step = 0
+        self._led_anim_frames = 0
+        self._led_anim_next_at = 0.0
 
     # -------------------- Logging --------------------
 
@@ -175,7 +196,7 @@ class RemoteProtocolTester:
             data.extend(pack_7bit(payload))
         return data
 
-    def _send_frame(self, data, label):
+    def _send_frame(self, data, label, log_hex=True):
         if not self.midi.out_port:
             reason = "No MIDI output port connected"
             self._log(f"TX {label} FAILED: {reason}")
@@ -183,9 +204,12 @@ class RemoteProtocolTester:
 
         try:
             self.midi.send_sysex(data)
-            hex_line = _fmt_sysex(data)
-            self.last_tx = f"{label}: {hex_line}"
-            self._log(f"TX {label}: {hex_line}")
+            if log_hex:
+                hex_line = _fmt_sysex(data)
+                self.last_tx = f"{label}: {hex_line}"
+                self._log(f"TX {label}: {hex_line}")
+            else:
+                self.last_tx = f"{label}: {len(data) + 2} bytes"
             return True, "sent"
         except Exception as exc:
             msg = str(exc)
@@ -204,7 +228,7 @@ class RemoteProtocolTester:
         data = self._build_message(MSG_EXIT_REMOTE)
         return self._send_frame(data, "EXIT_REMOTE")
 
-    def send_led_particular(self, entries):
+    def send_led_particular(self, entries, quiet=False):
         """LED command: set individual LEDs with RGB values.
 
         Each entry is a 5-byte chunk: [encoder, led, R, G, B]
@@ -220,7 +244,7 @@ class RemoteProtocolTester:
             b = _clamp(ent.get("b", 0), 0, 127)
             payload.extend([enc, led, r, g, b])
         data = self._build_message(MSG_LED, payload=payload)
-        return self._send_frame(data, f"LED count={len(entries)}")
+        return self._send_frame(data, f"LED count={len(entries)}", log_hex=not quiet)
 
     def send_led_particular_demo(self):
         """Demo: set all 16 LEDs on encoder 0 with visible RGB gradient."""
@@ -234,6 +258,193 @@ class RemoteProtocolTester:
                 "b": (led * 4) % 128,
             })
         return self.send_led_particular(entries)
+
+    def send_led_ring(self, entries, quiet=False):
+        """LED Ring command (06 04): set ring amount and style per encoder.
+
+        Each entry is a 7-byte chunk:
+          [encoder, r, g, b, amount_msb, amount_lsb, bipolar]
+        """
+        payload = []
+        for ent in entries:
+            enc = _clamp(ent.get("encoder", 0), 0, 15)
+            r = _clamp(ent.get("r", 0), 0, 127)
+            g = _clamp(ent.get("g", 0), 0, 127)
+            b = _clamp(ent.get("b", 0), 0, 127)
+            amount = _clamp(ent.get("amount", 0), 0, 16383)
+            msb = (amount >> 7) & 0x7F
+            lsb = amount & 0x7F
+            bipolar = 1 if bool(ent.get("bipolar", False)) else 0
+            payload.extend([enc, r, g, b, msb, lsb, bipolar])
+        data = self._build_message(MSG_LED_RING, payload=payload)
+        return self._send_frame(data, f"LED_RING count={len(entries)}", log_hex=not quiet)
+
+    def send_led_ring_demo(self):
+        """Demo: set all encoders with distinct colors/amounts and bipolar modes."""
+        entries = []
+        for enc in range(16):
+            amount = int((enc / 15.0) * 16383)
+            r, g, b = _color_wheel_7bit(enc * 24)
+            entries.append({
+                "encoder": enc,
+                "r": r,
+                "g": g,
+                "b": b,
+                "amount": amount,
+                "bipolar": (enc % 2 == 1),
+            })
+        return self.send_led_ring(entries)
+
+    def _build_particular_animation_entries(self):
+        """Rich per-LED color animation using explicit LED chunks."""
+        entries = []
+        for enc in range(16):
+            head = (self._led_anim_step + (enc * 2)) % 16
+            for led in range(16):
+                hue = (self._led_anim_step * 9 + enc * 11 + led * 17) % 384
+                r, g, b = _color_wheel_7bit(hue)
+
+                delta = (led - head) % 16
+                dist = min(delta, 16 - delta)
+                if dist == 0:
+                    scale = 127
+                elif dist == 1:
+                    scale = 96
+                elif dist == 2:
+                    scale = 64
+                elif dist == 3:
+                    scale = 32
+                else:
+                    scale = 10
+
+                entries.append({
+                    "encoder": enc,
+                    "led": led,
+                    "r": (r * scale) // 127,
+                    "g": (g * scale) // 127,
+                    "b": (b * scale) // 127,
+                })
+        return entries
+
+    def _build_ring_amount_animation_entries(self):
+        """Amount-style animation rendered via LED Ring chunks (06 04)."""
+        entries = []
+        for enc in range(16):
+            phase = (self._led_anim_step + enc * 3) % 64
+            tri = phase if phase <= 32 else (64 - phase)
+            amount = int((tri * 16383) / 32)
+            hue = (enc * 19 + self._led_anim_step * 13) % 384
+            r, g, b = _color_wheel_7bit(hue)
+            entries.append({
+                "encoder": enc,
+                "r": r,
+                "g": g,
+                "b": b,
+                "amount": amount,
+                "bipolar": (enc % 2 == 1),
+            })
+        return entries
+
+    def _build_ring_color_animation_entries(self):
+        """Color-only animation rendered via LED Ring chunks (06 04)."""
+        entries = []
+        for enc in range(16):
+            hue = (self._led_anim_step * 14 + enc * 23) % 384
+            r, g, b = _color_wheel_7bit(hue)
+            entries.append({
+                "encoder": enc,
+                "r": r,
+                "g": g,
+                "b": b,
+                "amount": 16383,
+                "bipolar": False,
+            })
+        return entries
+
+    def start_led_particular_animation(self, interval_ms=120):
+        if self.suite_running:
+            return False, "stop suite before starting animation"
+        if not self.midi.out_port:
+            return False, "No MIDI output port connected"
+        ms = _clamp(interval_ms, 20, 2000)
+        self.led_anim_running = True
+        self.led_anim_mode = "particular"
+        self.led_anim_interval_s = ms / 1000.0
+        self._led_anim_step = 0
+        self._led_anim_frames = 0
+        self._led_anim_next_at = time.perf_counter()
+        self._log(f"LED animation started: mode=particular interval={ms}ms")
+        return True, f"started ({ms} ms)"
+
+    def start_led_amount_animation(self, interval_ms=120):
+        if self.suite_running:
+            return False, "stop suite before starting animation"
+        if not self.midi.out_port:
+            return False, "No MIDI output port connected"
+        ms = _clamp(interval_ms, 20, 2000)
+        self.led_anim_running = True
+        self.led_anim_mode = "amount"
+        self.led_anim_interval_s = ms / 1000.0
+        self._led_anim_step = 0
+        self._led_anim_frames = 0
+        self._led_anim_next_at = time.perf_counter()
+        self._log(f"LED animation started: mode=amount_ring interval={ms}ms")
+        return True, f"started ({ms} ms)"
+
+    def start_led_ring_animation(self, interval_ms=120):
+        if self.suite_running:
+            return False, "stop suite before starting animation"
+        if not self.midi.out_port:
+            return False, "No MIDI output port connected"
+        ms = _clamp(interval_ms, 20, 2000)
+        self.led_anim_running = True
+        self.led_anim_mode = "ring"
+        self.led_anim_interval_s = ms / 1000.0
+        self._led_anim_step = 0
+        self._led_anim_frames = 0
+        self._led_anim_next_at = time.perf_counter()
+        self._log(f"LED animation started: mode=ring_color interval={ms}ms")
+        return True, f"started ({ms} ms)"
+
+    def stop_led_animation(self, reason="stopped"):
+        if not self.led_anim_running:
+            return False, "animation not running"
+        mode = self.led_anim_mode
+        self.led_anim_running = False
+        self.led_anim_mode = ""
+        self._log(f"LED animation stopped: mode={mode} ({reason})")
+        return True, reason
+
+    def _tick_led_animation(self):
+        if not self.led_anim_running:
+            return
+
+        now = time.perf_counter()
+        if now < self._led_anim_next_at:
+            return
+
+        if self.led_anim_mode == "particular":
+            entries = self._build_particular_animation_entries()
+            ok, msg = self.send_led_particular(entries, quiet=True)
+        elif self.led_anim_mode == "amount":
+            entries = self._build_ring_amount_animation_entries()
+            ok, msg = self.send_led_ring(entries, quiet=True)
+        else:
+            entries = self._build_ring_color_animation_entries()
+            ok, msg = self.send_led_ring(entries, quiet=True)
+
+        if not ok:
+            self.led_anim_running = False
+            self._log(f"LED animation stopped: send failed ({msg})")
+            return
+
+        self._led_anim_frames += 1
+        self._led_anim_step = (self._led_anim_step + 1) % 4096
+        self._led_anim_next_at = now + self.led_anim_interval_s
+        self.last_tx = f"LED_ANIM {self.led_anim_mode} frame={self._led_anim_frames} entries={len(entries)}"
+        if self._led_anim_frames % 40 == 0:
+            interval_ms = int(round(self.led_anim_interval_s * 1000.0))
+            self._log(f"LED animation heartbeat: mode={self.led_anim_mode} frame={self._led_anim_frames} interval={interval_ms}ms")
 
     def send_oled_labels(self, title, labels):
         """OLED Labels: 16-char title + 16 x 4-char labels = 80 raw bytes.
@@ -488,6 +699,8 @@ class RemoteProtocolTester:
     def start_full_suite(self):
         if self.suite_running:
             return False, "suite already running"
+        if self.led_anim_running:
+            self.stop_led_animation("suite started")
 
         self.suite_results = []
         self.suite_steps = []
@@ -529,6 +742,17 @@ class RemoteProtocolTester:
                 "manual": True,
                 "timeout_s": 30.0,
                 "prompt": "Confirm individual LEDs rendered correctly, then click Manual PASS/FAIL.",
+            },
+            {
+                "name": "LED ring amount batch",
+                "action": self.send_led_ring_demo,
+                "pass_msg": "Sent LED ring amount+bipolar batch",
+            },
+            {
+                "name": "Verify LED ring visual",
+                "manual": True,
+                "timeout_s": 30.0,
+                "prompt": "Confirm ring amount and bipolar rendering, then click Manual PASS/FAIL.",
             },
             {
                 "name": "OLED labels",
@@ -608,6 +832,8 @@ class RemoteProtocolTester:
         return True, "recorded"
 
     def tick(self):
+        self._tick_led_animation()
+
         step = self._current_step()
         if not step:
             return
@@ -663,4 +889,8 @@ class RemoteProtocolTester:
             "suite_prompt": current_prompt,
             "suite_manual_pending": self.suite_manual_pending,
             "suite_results": list(self.suite_results),
+            "led_anim_running": self.led_anim_running,
+            "led_anim_mode": self.led_anim_mode,
+            "led_anim_interval_ms": int(round(self.led_anim_interval_s * 1000.0)),
+            "led_anim_frames": self._led_anim_frames,
         }

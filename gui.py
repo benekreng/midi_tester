@@ -113,6 +113,7 @@ class AppGui:
     def reset_remote_cb(self, sender, app_data):
         self.settings.reset_section("remote")
         self.remote.stop_suite("reset")
+        self.remote.stop_led_animation("reset")
         self.remote.clear_all_activity()
         self.apply_settings(section="remote")
 
@@ -173,6 +174,38 @@ class AppGui:
 
     def remote_send_led_demo_cb(self, sender, app_data):
         self._remote_action(self.remote.send_led_particular_demo, "LED_DEMO")
+
+    def remote_send_led_ring_demo_cb(self, sender, app_data):
+        self._remote_action(self.remote.send_led_ring_demo, "LED_RING_DEMO")
+
+    def remote_led_anim_interval_cb(self, sender, app_data):
+        remote = self.settings.data.setdefault("remote", {})
+        remote["led_anim_interval_ms"] = int(app_data)
+        self._save_settings()
+
+    def remote_start_particular_anim_cb(self, sender, app_data):
+        interval_ms = int(dpg.get_value("remote_led_anim_interval"))
+        self._remote_action(
+            lambda: self.remote.start_led_particular_animation(interval_ms),
+            "LED_ANIM_PARTICULAR_START",
+        )
+
+    def remote_start_amount_anim_cb(self, sender, app_data):
+        interval_ms = int(dpg.get_value("remote_led_anim_interval"))
+        self._remote_action(
+            lambda: self.remote.start_led_amount_animation(interval_ms),
+            "LED_RING_AMOUNT_ANIM_START",
+        )
+
+    def remote_start_ring_anim_cb(self, sender, app_data):
+        interval_ms = int(dpg.get_value("remote_led_anim_interval"))
+        self._remote_action(
+            lambda: self.remote.start_led_ring_animation(interval_ms),
+            "LED_RING_COLOR_ANIM_START",
+        )
+
+    def remote_stop_anim_cb(self, sender, app_data):
+        self._remote_action(lambda: self.remote.stop_led_animation("stopped by user"), "LED_ANIM_STOP")
 
     def remote_send_oled_labels_cb(self, sender, app_data):
         title = dpg.get_value("remote_oled_title")
@@ -696,6 +729,26 @@ class AppGui:
                         with dpg.group(horizontal=True):
                             dpg.add_button(label="Send LED", callback=self.remote_send_led_particular_cb)
                             dpg.add_button(label="Send LED Demo", callback=self.remote_send_led_demo_cb)
+                            dpg.add_button(label="Send LED Ring Demo", callback=self.remote_send_led_ring_demo_cb)
+
+                        dpg.add_separator()
+                        dpg.add_text("LED Animations")
+                        dpg.add_text("Ring modes use LED Ring (06 04): amount+bipolar or color sweep.", color=(180, 180, 180))
+                        with dpg.group(horizontal=True):
+                            dpg.add_slider_int(
+                                label="Frame (ms)",
+                                min_value=20,
+                                max_value=1000,
+                                default_value=120,
+                                width=170,
+                                tag="remote_led_anim_interval",
+                                callback=self.remote_led_anim_interval_cb,
+                            )
+                            dpg.add_button(label="Start Particular Anim", callback=self.remote_start_particular_anim_cb)
+                            dpg.add_button(label="Start Amount Anim", callback=self.remote_start_amount_anim_cb)
+                            dpg.add_button(label="Start Ring Anim", callback=self.remote_start_ring_anim_cb)
+                            dpg.add_button(label="Stop Anim", callback=self.remote_stop_anim_cb)
+                        dpg.add_text("LED Animation: idle", tag="remote_led_anim_status")
 
                         dpg.add_separator()
                         dpg.add_text("OLED Labels")
@@ -883,6 +936,11 @@ class AppGui:
                 if dpg.does_item_exist("remote_expected_channel"):
                     dpg.set_value("remote_expected_channel", expected_channel)
                     self.remote_expected_channel_cb(None, expected_channel)
+
+                interval_ms = int(remote.get("led_anim_interval_ms", 120))
+                if dpg.does_item_exist("remote_led_anim_interval"):
+                    dpg.set_value("remote_led_anim_interval", interval_ms)
+                    self.remote_led_anim_interval_cb(None, interval_ms)
         finally:
             self._applying_settings = False
 
@@ -1009,6 +1067,15 @@ class AppGui:
         if snap["suite_manual_pending"]:
             prompt = f"Manual action required: {prompt}"
         dpg.set_value("remote_suite_prompt", f"Suite Prompt: {prompt}")
+
+        if snap.get("led_anim_running"):
+            mode = snap.get("led_anim_mode", "?")
+            frames = snap.get("led_anim_frames", 0)
+            interval_ms = snap.get("led_anim_interval_ms", 0)
+            anim_text = f"LED Animation: running ({mode}) frame={frames} @ {interval_ms}ms"
+        else:
+            anim_text = "LED Animation: idle"
+        dpg.set_value("remote_led_anim_status", anim_text)
 
         results = snap.get("suite_results", [])
         if len(results) != self._remote_results_last:

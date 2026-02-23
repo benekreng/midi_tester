@@ -48,6 +48,7 @@
     "feedback_mode": "None"
   },
   "remote": {
-    "expected_channel": "1"
+    "expected_channel": "1",
+    "led_anim_interval_ms": 120
   }
 }
