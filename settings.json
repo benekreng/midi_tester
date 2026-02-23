@@ -1,8 +1,8 @@
 {
   "connections": {
     "channel": "1",
-    "input_port": "Volt 1",
-    "output_port": "Volt 1",
+    "input_port": "OXI E16 Port 1",
+    "output_port": "OXI E16 Port 1",
     "virtual": false
   },
   "fuzz": {
@@ -46,5 +46,8 @@
   "main": {
     "delay_ms": 200,
     "feedback_mode": "None"
+  },
+  "remote": {
+    "expected_channel": "1"
   }
 }

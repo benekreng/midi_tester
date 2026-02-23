@@ -24,15 +24,19 @@ PARAMS = {
 }
 
 class AppGui:
-    def __init__(self, midi_backend, processor, endurance_monitor, fuzz_test, settings_store):
+    def __init__(self, midi_backend, processor, endurance_monitor, fuzz_test, remote_tester, settings_store):
         self.midi = midi_backend
         self.processor = processor
         self.endurance = endurance_monitor
         self.fuzz = fuzz_test
+        self.remote = remote_tester
         self.settings = settings_store
         self.log_items = []
         self._endurance_offset_labels = list(self.endurance.offset_labels)
         self._fuzz_missing_last = 0
+        self._remote_log_last = 0
+        self._remote_log_tail = ""
+        self._remote_results_last = 0
         self._type_label_to_type = {LABELS[m]: m for m in ALL_TYPES}
         self._type_labels = [LABELS[m] for m in ALL_TYPES]
         self._applying_settings = False
@@ -48,6 +52,12 @@ class AppGui:
     def get_selected_channel(self):
         val = dpg.get_value("channel_combo")
         if val == "Omni": return -1
+        return int(val) - 1
+
+    def _get_remote_channel(self):
+        val = dpg.get_value("remote_expected_channel")
+        if val == "Omni":
+            return -1
         return int(val) - 1
 
     # --- CALLBACKS ---
@@ -99,6 +109,99 @@ class AppGui:
     def reset_fuzz_cb(self, sender, app_data):
         self.settings.reset_section("fuzz")
         self.apply_settings(section="fuzz")
+
+    def reset_remote_cb(self, sender, app_data):
+        self.settings.reset_section("remote")
+        self.remote.stop_suite("reset")
+        self.remote.clear_all_activity()
+        self.apply_settings(section="remote")
+
+    def _remote_action(self, action, label):
+        ok, msg = action()
+        state = "OK" if ok else "FAIL"
+        self.log_midi(f"Remote {label}: {state} ({msg})")
+        return ok
+
+    def remote_expected_channel_cb(self, sender, app_data):
+        self.remote.expected_channel = self._get_remote_channel()
+        remote = self.settings.data.setdefault("remote", {})
+        remote["expected_channel"] = str(app_data)
+        self._save_settings()
+
+    def remote_clear_activity_cb(self, sender, app_data):
+        self.remote.clear_all_activity()
+        self._remote_log_last = 0
+        self._remote_log_tail = ""
+        self._remote_results_last = 0
+        self.log_midi("Remote activity cleared")
+
+    def remote_send_enter_cb(self, sender, app_data):
+        self._remote_action(self.remote.send_enter_remote, "ENTER_REMOTE")
+
+    def remote_send_exit_cb(self, sender, app_data):
+        self._remote_action(self.remote.send_exit_remote, "EXIT_REMOTE")
+
+    def _parse_led_entries(self, text):
+        entries = []
+        raw = str(text or "").strip()
+        if not raw:
+            return entries, "empty entry list"
+
+        for idx, chunk in enumerate(raw.split(";"), start=1):
+            fields = [part.strip() for part in chunk.split(",") if part.strip() != ""]
+            if len(fields) != 5:
+                return [], f"entry {idx} must have 5 numbers: enc,led,r,g,b"
+            try:
+                enc, led, red, green, blue = [int(v, 0) for v in fields]
+            except ValueError:
+                return [], f"entry {idx} has invalid number"
+            entries.append({
+                "encoder": enc,
+                "led": led,
+                "r": red,
+                "g": green,
+                "b": blue,
+            })
+        return entries, "parsed"
+
+    def remote_send_led_particular_cb(self, sender, app_data):
+        entries, msg = self._parse_led_entries(dpg.get_value("remote_led_entries"))
+        if not entries:
+            self.log_midi(f"Remote LED: FAIL ({msg})")
+            return
+        self._remote_action(lambda: self.remote.send_led_particular(entries), "LED")
+
+    def remote_send_led_demo_cb(self, sender, app_data):
+        self._remote_action(self.remote.send_led_particular_demo, "LED_DEMO")
+
+    def remote_send_oled_labels_cb(self, sender, app_data):
+        title = dpg.get_value("remote_oled_title")
+        labels_text = str(dpg.get_value("remote_oled_labels") or "")
+        labels = [part.strip() for part in labels_text.split(",")]
+        self._remote_action(lambda: self.remote.send_oled_labels(title, labels), "OLED_LABELS")
+
+    def remote_send_oled_labels_demo_cb(self, sender, app_data):
+        self._remote_action(self.remote.send_oled_labels_demo, "OLED_LABELS_DEMO")
+
+    def remote_send_oled_fb_cb(self, sender, app_data):
+        pattern = dpg.get_value("remote_fb_pattern")
+        self._remote_action(lambda: self.remote.send_oled_framebuffer(pattern), "OLED_FRAMEBUFFER")
+
+    def remote_send_raw_hex_cb(self, sender, app_data):
+        text = dpg.get_value("remote_raw_hex")
+        self._remote_action(lambda: self.remote.send_raw_hex(text), "RAW_SYSEX")
+
+    def remote_suite_start_cb(self, sender, app_data):
+        self._remote_action(self.remote.start_full_suite, "SUITE_START")
+
+    def remote_suite_stop_cb(self, sender, app_data):
+        self._remote_action(lambda: self.remote.stop_suite("stopped by user"), "SUITE_STOP")
+
+    def remote_suite_manual_pass_cb(self, sender, app_data):
+        self._remote_action(lambda: self.remote.mark_manual_step(True), "SUITE_MANUAL_PASS")
+
+    def remote_suite_manual_fail_cb(self, sender, app_data):
+        self._remote_action(lambda: self.remote.mark_manual_step(False), "SUITE_MANUAL_FAIL")
 
     def feedback_mode_cb(self, sender, app_data):
         # app_data will be "None", "Immediate", or "Delayed" based on radio button
@@ -553,6 +656,100 @@ class AppGui:
                     with dpg.child_window(tag="fuzz_missing_window", height=120, autosize_x=True):
                         dpg.add_group(tag="fuzz_missing_group")
 
+                with dpg.tab(label="Remote Test"):
+                    dpg.add_text("OXI E16 Remote Mode Protocol Tester", color=(180, 230, 255))
+                    dpg.add_spacer(height=4)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="Reset Remote Tab", callback=self.reset_remote_cb)
+                        dpg.add_button(label="Clear Activity", callback=self.remote_clear_activity_cb)
+                        dpg.add_text("RX Ch:")
+                        dpg.add_combo(
+                            [str(i) for i in range(1, 17)] + ["Omni"],
+                            default_value="1",
+                            width=90,
+                            tag="remote_expected_channel",
+                            callback=self.remote_expected_channel_cb,
+                        )
+
+                    with dpg.collapsing_header(label="Session + Full Suite", default_open=True):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Enter Remote", callback=self.remote_send_enter_cb)
+                            dpg.add_button(label="Exit Remote", callback=self.remote_send_exit_cb)
+                            dpg.add_button(label="Start Full Suite", callback=self.remote_suite_start_cb)
+                            dpg.add_button(label="Stop Suite", callback=self.remote_suite_stop_cb)
+                            dpg.add_button(label="Manual PASS", callback=self.remote_suite_manual_pass_cb)
+                            dpg.add_button(label="Manual FAIL", callback=self.remote_suite_manual_fail_cb)
+                        dpg.add_text("Suite Progress: -", tag="remote_suite_progress")
+                        dpg.add_text("Suite Step: -", tag="remote_suite_step")
+                        dpg.add_text("Suite Prompt: -", tag="remote_suite_prompt", wrap=1000)
+                        with dpg.child_window(tag="remote_results_window", height=120, autosize_x=True):
+                            dpg.add_group(tag="remote_results_group")
+
+                    with dpg.collapsing_header(label="Host -> Device Commands", default_open=True):
+                        dpg.add_text("LED")
+                        dpg.add_input_text(
+                            label="Entries (enc,led,r,g,b; ...)",
+                            tag="remote_led_entries",
+                            width=-1,
+                            default_value="0,0,127,0,0; 0,1,0,127,0; 0,2,0,0,127",
+                        )
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Send LED", callback=self.remote_send_led_particular_cb)
+                            dpg.add_button(label="Send LED Demo", callback=self.remote_send_led_demo_cb)
+
+                        dpg.add_separator()
+                        dpg.add_text("OLED Labels")
+                        dpg.add_input_text(
+                            label="Title (16 chars)",
+                            tag="remote_oled_title",
+                            width=260,
+                            default_value="REMOTE TEST",
+                        )
+                        dpg.add_input_text(
+                            label="Labels CSV (16 items)",
+                            tag="remote_oled_labels",
+                            width=-1,
+                            default_value="K00,K01,K02,K03,K04,K05,K06,K07,K08,K09,K10,K11,K12,K13,K14,K15",
+                        )
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Send OLED Labels", callback=self.remote_send_oled_labels_cb)
+                            dpg.add_button(label="Send OLED Labels Demo", callback=self.remote_send_oled_labels_demo_cb)
+
+                        dpg.add_separator()
+                        dpg.add_text("OLED Framebuffer")
+                        with dpg.group(horizontal=True):
+                            dpg.add_combo(
+                                ["Checkerboard", "All Off", "All On", "Vertical Bars", "Horizontal Bars", "Diagonal"],
+                                default_value="Checkerboard",
+                                width=180,
+                                tag="remote_fb_pattern",
+                            )
+                            dpg.add_button(label="Send OLED Framebuffer", callback=self.remote_send_oled_fb_cb)
+
+                        dpg.add_separator()
+                        dpg.add_text("Raw SysEx (hex bytes, optional F0/F7)")
+                        dpg.add_input_text(
+                            tag="remote_raw_hex",
+                            multiline=True,
+                            width=-1,
+                            height=70,
+                            default_value="F0 00 21 5B 02 01 06 55 F7",
+                        )
+                        dpg.add_button(label="Send Raw SysEx", callback=self.remote_send_raw_hex_cb)
+
+                    with dpg.collapsing_header(label="Live Protocol Activity", default_open=True):
+                        dpg.add_text("Protocol SysEx RX: 0", tag="remote_protocol_sysex_rx")
+                        dpg.add_text("Other SysEx RX: 0", tag="remote_other_sysex_rx")
+                        dpg.add_text("ACKs: 0", tag="remote_ack_count")
+                        dpg.add_text("Encoder CCs: 0", tag="remote_encoder_cc_count")
+                        dpg.add_text("Button notes: 0", tag="remote_button_note_count")
+                        dpg.add_text("SHIFT notes: 0", tag="remote_shift_note_count")
+                        dpg.add_text("Last TX: -", tag="remote_last_tx", wrap=1000)
+                        dpg.add_text("Last RX: -", tag="remote_last_rx", wrap=1000)
+                        dpg.add_text("Last Event: -", tag="remote_last_event", wrap=1000)
+                        with dpg.child_window(tag="remote_log_window", height=180, autosize_x=True):
+                            dpg.add_group(tag="remote_log_group")
+
     def update_endurance_plot(self):
         x_vals, y_vals = self.endurance.get_plot_data()
         dpg.set_value("endurance_plot_series", [x_vals, y_vals])
@@ -678,6 +875,14 @@ class AppGui:
                 enabled = bool(fuzz.get("enabled", False))
                 dpg.set_value("fuzz_enabled", enabled)
                 self.fuzz_toggle_cb(None, enabled)
+
+            if section in (None, "remote"):
+                remote = self.settings.data.get("remote", {})
+
+                expected_channel = str(remote.get("expected_channel", self._default_channel))
+                if dpg.does_item_exist("remote_expected_channel"):
+                    dpg.set_value("remote_expected_channel", expected_channel)
+                    self.remote_expected_channel_cb(None, expected_channel)
         finally:
             self._applying_settings = False
 
@@ -781,6 +986,49 @@ class AppGui:
         for item in missing:
             dpg.add_text(item, parent="fuzz_missing_group")
         self._fuzz_missing_last = len(missing)
+
+    def update_remote_status(self):
+        if not dpg.does_item_exist("remote_protocol_sysex_rx"):
+            return
+
+        snap = self.remote.get_status_snapshot()
+        dpg.set_value("remote_protocol_sysex_rx", f"Protocol SysEx RX: {snap['protocol_sysex_rx']}")
+        dpg.set_value("remote_other_sysex_rx", f"Other SysEx RX: {snap['other_sysex_rx']}")
+        dpg.set_value("remote_ack_count", f"ACKs: {snap['ack_count']}")
+        dpg.set_value("remote_encoder_cc_count", f"Encoder CCs: {snap['encoder_cc_count']}")
+        dpg.set_value("remote_button_note_count", f"Button notes: {snap['button_note_count']}")
+        dpg.set_value("remote_shift_note_count", f"SHIFT notes: {snap['shift_note_count']}")
+        dpg.set_value("remote_last_tx", f"Last TX: {snap['last_tx']}")
+        dpg.set_value("remote_last_rx", f"Last RX: {snap['last_rx']}")
+        dpg.set_value("remote_last_event", f"Last Event: {snap['last_event']}")
+
+        suite_state = "running" if snap["suite_running"] else "idle"
+        dpg.set_value("remote_suite_progress", f"Suite Progress: {snap['suite_progress']} ({suite_state})")
+        dpg.set_value("remote_suite_step", f"Suite Step: {snap['suite_current']}")
+        prompt = snap["suite_prompt"] or "-"
+        if snap["suite_manual_pending"]:
+            prompt = f"Manual action required: {prompt}"
+        dpg.set_value("remote_suite_prompt", f"Suite Prompt: {prompt}")
+
+        results = snap.get("suite_results", [])
+        if len(results) != self._remote_results_last:
+            dpg.delete_item("remote_results_group", children_only=True)
+            for result in results:
+                status = result.get("status", "FAIL")
+                name = result.get("name", "step")
+                detail = result.get("detail", "")
+                color = (140, 255, 140) if status == "PASS" else (255, 150, 150)
+                dpg.add_text(f"{status}: {name} ({detail})", parent="remote_results_group", color=color)
+            self._remote_results_last = len(results)
+
+        logs = self.remote.get_log_lines()
+        tail = logs[-1] if logs else ""
+        if len(logs) != self._remote_log_last or tail != self._remote_log_tail:
+            dpg.delete_item("remote_log_group", children_only=True)
+            for line in logs:
+                dpg.add_text(line, parent="remote_log_group")
+            self._remote_log_last = len(logs)
+            self._remote_log_tail = tail
 
     def update_knob_from_midi(self, param_type, param_id, val):
         """Updates GUI knob without triggering the callback loop"""

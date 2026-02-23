@@ -41,6 +41,9 @@ DEFAULT_SETTINGS = {
         "min_gap": 0.0,
         "max_gap": 1000.0,
     },
+    "remote": {
+        "expected_channel": "1",
+    },
 }
 
 

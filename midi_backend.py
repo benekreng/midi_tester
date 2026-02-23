@@ -118,6 +118,12 @@ class MidiBackend:
     def send_note(self, channel, note, velocity):
         if self.out_port:
             self.out_port.send(mido.Message('note_on', channel=channel, note=note, velocity=velocity))
+
+    def send_sysex(self, data):
+        """Send a SysEx frame where data excludes F0/F7 (mido adds them)."""
+        if self.out_port:
+            payload = [int(b) for b in list(data or [])]
+            self.out_port.send(mido.Message('sysex', data=payload))
             
     def send_event_struct(self, e):
         """Helper to send a structured event dict (from poll_messages) back out."""
@@ -230,7 +236,14 @@ class MidiBackend:
             if ccNum <= 31:
                 self._cc14_msb_num = ccNum
                 self._cc14_msb_val = ccVal
-            
+
             events.append({'type': 'cc', 'channel': msg.channel, 'cc': ccNum, 'value': ccVal, 'timestamp': ts})
+
+        elif msg.type == 'sysex':
+            events.append({
+                'type': 'sysex',
+                'data': list(msg.data),
+                'timestamp': ts,
+            })
 
         return events

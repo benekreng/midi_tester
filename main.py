@@ -3,6 +3,7 @@ from midi_backend import MidiBackend
 from processor import MidiProcessor
 from endurance_monitor import EnduranceLatencyMonitor
 from fuzz_test import FuzzTest
+from remote_protocol_tester import RemoteProtocolTester
 from settings_store import SettingsStore
 from gui import AppGui
 
@@ -12,12 +13,13 @@ def main():
     processor = MidiProcessor(midi)
     endurance = EnduranceLatencyMonitor(midi)
     fuzz = FuzzTest(midi)
+    remote = RemoteProtocolTester(midi)
     settings = SettingsStore()
     settings.load()
     
     # 2. Setup GUI
     dpg.create_context()
-    gui = AppGui(midi, processor, endurance, fuzz, settings)
+    gui = AppGui(midi, processor, endurance, fuzz, remote, settings)
     gui.build()
     
     dpg.setup_dearpygui()
@@ -60,6 +62,12 @@ def main():
             gui.update_fuzz_plot()
         gui.update_fuzz_stats()
         gui.update_fuzz_missing_log()
+
+        # Remote protocol tester
+        for event in processed_events:
+            remote.handle_event(event)
+        remote.tick()
+        gui.update_remote_status()
         
         for e in processed_events:
             if selected_ch != -1 and 'channel' in e and e['channel'] != selected_ch:
